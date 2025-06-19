@@ -7,11 +7,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, BufferedInputFile, CallbackQuery, InputMediaPhoto, InlineKeyboardButton, \
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup, KeyboardButtonRequestChat
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import re
 
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 import uuid
 import os
 import aiomysql
@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from PicImageSearch import Network, Yandex
 from PicImageSearch.model import YandexResponse
 from anime_parsers_ru import ShikimoriParserAsync
+import random
 
 # Настройка логгера
 logging.basicConfig(level=logging.ERROR)
@@ -93,6 +94,20 @@ async def register_user(user_id: int, username: str, first_name: str, last_name:
                     (user_id, username, first_name, last_name)
                 )
                 await conn.commit()
+
+
+def share_bot():
+    markup = InlineKeyboardBuilder()
+    markup.button(
+        text="Поделиться в чате 🚀",
+        switch_inline_query=" – бот поиска аниме по скриншоту"
+    )
+    markup.button(
+        text="Задонатить 💰",
+        url="https://yoomoney.ru/to/410018587631465"
+    )
+    markup.adjust(1)
+    return markup.as_markup()
 
 
 def actions_keyboard():
@@ -195,9 +210,8 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
 
     for i, result in enumerate(resp.raw[start_idx:end_idx], start=start_idx + 1):
         if result.title:
-            # Разделяем заголовок по указанным разделителям и берем первую часть
             title_parts = re.split(r'[-–—]', result.title)
-            clean_title = title_parts[0].strip()  # Берем первую часть и убираем пробелы
+            clean_title = title_parts[0].strip()
             original_title = result.title.strip()
         else:
             clean_title = 'Без названия'
@@ -210,19 +224,19 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
             f"🔗 <a href='{result.url}'>Источник</a>\n\n"
         )
 
-
         if result.thumbnail:
             media_group.append(InputMediaPhoto(
                 media=result.thumbnail,
                 caption=f"Результат #{i} | Страница {page}/{total_pages}",
                 parse_mode=ParseMode.HTML
             ))
-    results_text += f"\n\n<blockquote><b>Скопировать название можно нажатием\nДля поиска аниме по названию используйте /anime</b></blockquote>"
+
+    results_text += "\n\n<blockquote><b>Скопировать название можно нажатием\nДля поиска аниме по названию используйте /anime</b></blockquote>"
+
     try:
         if len(media_group) > 1:
             if edit_message_id:
                 try:
-                    # Пытаемся отредактировать сообщение
                     await message.bot.edit_message_text(
                         chat_id=message.chat.id,
                         message_id=edit_message_id,
@@ -231,17 +245,25 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
                         disable_web_page_preview=True
                     )
                 except:
-                    # Если не получилось редактировать, отправляем новое
                     edit_message_id = None
 
             if not edit_message_id:
-                await message.answer_media_group(media_group)
-                msg = await message.answer(
-                    results_text,
-                    reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
-                    disable_web_page_preview=True
-                )
-                return msg.message_id
+                try:
+                    # Добавляем задержку перед отправкой медиагруппы
+                    await asyncio.sleep(1)  # 1 секунда задержки
+                    await message.answer_media_group(media_group)
+                    msg = await message.answer(
+                        results_text,
+                        reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
+                        disable_web_page_preview=True
+                    )
+                    return msg.message_id
+                except TelegramRetryAfter as e:
+                    # Обработка флуд-контроля
+                    retry_after = e.retry_after
+                    await message.answer(f"⚠️ Слишком быстро! Подождите {retry_after} секунд...")
+                    await asyncio.sleep(retry_after)
+                    return await send_result_page(message, resp, page, items_per_page, edit_message_id)
 
         elif media_group:
             if edit_message_id:
@@ -261,13 +283,19 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
                     edit_message_id = None
 
             if not edit_message_id:
-                msg = await message.answer_photo(
-                    photo=media_group[0].media,
-                    caption=results_text,
-                    reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
-                    parse_mode=ParseMode.HTML
-                )
-                return msg.message_id
+                try:
+                    msg = await message.answer_photo(
+                        photo=media_group[0].media,
+                        caption=results_text,
+                        reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
+                        parse_mode=ParseMode.HTML
+                    )
+                    return msg.message_id
+                except TelegramRetryAfter as e:
+                    retry_after = e.retry_after
+                    await message.answer(f"⚠️ Слишком быстро! Подождите {retry_after} секунд...")
+                    await asyncio.sleep(retry_after)
+                    return await send_result_page(message, resp, page, items_per_page, edit_message_id)
 
         else:
             if edit_message_id:
@@ -284,12 +312,18 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
                     edit_message_id = None
 
             if not edit_message_id:
-                msg = await message.answer(
-                    results_text,
-                    reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
-                    disable_web_page_preview=True
-                )
-                return msg.message_id
+                try:
+                    msg = await message.answer(
+                        results_text,
+                        reply_markup=create_pagination_keyboard(resp.url, page, total_pages),
+                        disable_web_page_preview=True
+                    )
+                    return msg.message_id
+                except TelegramRetryAfter as e:
+                    retry_after = e.retry_after
+                    await message.answer(f"⚠️ Слишком быстро! Подождите {retry_after} секунд...")
+                    await asyncio.sleep(retry_after)
+                    return await send_result_page(message, resp, page, items_per_page, edit_message_id)
 
     except Exception as e:
         logger.error(f"Error sending results: {e}")
@@ -312,6 +346,9 @@ async def send_result_page(message: Message, resp: YandexResponse, page: int = 1
             disable_web_page_preview=True
         )
         return msg.message_id
+
+
+
 
 
 @dp.callback_query(F.data.startswith("page_"))
@@ -361,6 +398,11 @@ async def handle_photo(message: Message, state: FSMContext):
         if resp:
             await state.update_data(yandex_response=resp)
             await send_result_page(message, resp)
+
+            await message.answer(
+                "❤ Понравился бот?\n\nПоделись им с другом или знакомым 🤗",
+                reply_markup=share_bot()
+            )
         else:
             await message.answer("❌ Не удалось обработать изображение. Попробуйте другой скриншот.")
 
@@ -656,6 +698,10 @@ async def search_anime_info(message: Message, anime_name: str, state: FSMContext
         if current_state == AnimeSearchStates.waiting_for_anime_name:
             await state.set_state(None)
 
+        await message.answer(
+            "❤ Понравился бот?\n\nПоделись им с другом или знакомым 🤗",
+            reply_markup=share_bot()
+        )
 
 
 
@@ -753,6 +799,7 @@ async def send_to_all_users(message: Message):
         for user in users:
             user_id = user[0]
             try:
+                await asyncio.sleep(1)
                 await bot.send_message(user_id, sendtext)
                 success += 1
             except (TelegramForbiddenError, TelegramBadRequest) as e:
